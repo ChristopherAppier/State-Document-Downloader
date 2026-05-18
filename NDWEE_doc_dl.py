@@ -13,13 +13,18 @@ Requirements:
 
 import os
 import re
+import csv
+import random
 import time
 import queue
 import threading
 import requests
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timezone, timedelta
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -36,6 +41,16 @@ KW_PROGRAM    = 115
 KW_PROGRAM_ID = 116
 
 DELAY_BETWEEN_DOWNLOADS = 0.5
+MAX_WORKERS_CAP = 8
+
+CONNECT_TIMEOUT = 10
+DOWNLOAD_TIMEOUT = 60
+DOWNLOAD_STREAM_TIMEOUT = (CONNECT_TIMEOUT, DOWNLOAD_TIMEOUT)
+
+MAX_RETRIES = 3
+RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRY_BACKOFF_BASE = 0.5
+RETRY_BACKOFF_CAP = 8.0
 
 HEADERS = {
     "User-Agent": (
@@ -95,6 +110,55 @@ def get_server_filename(response: requests.Response) -> str:
     return match.group(1).strip() if match else ""
 
 
+class NDWEEDownloader:
+    """Per-thread downloader with its own HTTP session."""
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self._configure_retries()
+
+    def _configure_retries(self):
+        retry_cfg = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            status=2,
+            backoff_factor=0.4,
+            status_forcelist=sorted(RETRIABLE_STATUS_CODES),
+            allowed_methods=frozenset({"GET"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry_cfg)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def fetch_document(self, token: str) -> requests.Response:
+        url = DOC_URL.format(token=token)
+        response = self.session.get(url, headers=HEADERS, timeout=DOWNLOAD_STREAM_TIMEOUT, stream=True)
+        response.raise_for_status()
+        return response
+
+    @staticmethod
+    def write_atomic_stream(response: requests.Response, out_path: str):
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        tmp_path = f"{out_path}.part"
+        try:
+            with open(tmp_path, "wb") as fh:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        fh.write(chunk)
+            os.replace(tmp_path, out_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -103,6 +167,12 @@ class App(tk.Tk):
         self.title("ECMP Nebraska Bulk Downloader")
         self.resizable(False, False)
         self._msg_queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._dl_local = threading.local()
+        self._rate_lock = threading.Lock()
+        self._next_request_ts = 0.0
+        self._name_lock = threading.Lock()
+        self._reserved_names = set()
         self._build_ui()
         self._poll_queue()
 
@@ -155,10 +225,15 @@ class App(tk.Tk):
         ttk.Entry(dest_row, textvariable=self.dest_var, width=34).pack(side="left")
         ttk.Button(dest_row, text="Browse…", command=self._browse).pack(side="left", padx=(6, 0))
 
-        # ── Action button
+        # ── Action buttons
+        action_row = ttk.Frame(self)
+        action_row.grid(row=2, column=0, pady=(6, 4))
         self.download_btn = ttk.Button(
-            self, text="Search & Download", command=self._start, width=28)
-        self.download_btn.grid(row=2, column=0, pady=(6, 4))
+            action_row, text="Search & Download", command=self._start, width=24)
+        self.download_btn.pack(side="left", padx=(0, 6))
+        self.stop_btn = ttk.Button(
+            action_row, text="Stop", command=self._stop_download, width=10, state="disabled")
+        self.stop_btn.pack(side="left")
 
         # ── Progress frame
         prog_frm = ttk.LabelFrame(self, text="Progress", padding=12)
@@ -249,6 +324,12 @@ class App(tk.Tk):
         to_date   = self._get_date(self.to_var)
         dest      = self.dest_var.get().strip()
 
+        self._stop_event.clear()
+        self.stop_btn.config(state="disabled")
+        self._next_request_ts = 0.0
+        with self._name_lock:
+            self._reserved_names.clear()
+
         self.download_btn.config(state="disabled")
         self._set_status("Querying ECMP API…")
         self.progress_var.set(0)
@@ -286,53 +367,280 @@ class App(tk.Tk):
             daemon=True,
         ).start()
 
+    def _stop_download(self):
+        self._stop_event.set()
+        self.stop_btn.config(state="disabled")
+        self._set_status("Stop requested. Finishing in-flight downloads…")
+
+    def _compute_worker_count(self, total_docs: int) -> int:
+        cpus = os.cpu_count() or 2
+        return max(1, min(MAX_WORKERS_CAP, total_docs, max(2, cpus * 2)))
+
+    def _get_thread_downloader(self) -> NDWEEDownloader:
+        downloader = getattr(self._dl_local, "downloader", None)
+        if downloader is None:
+            downloader = NDWEEDownloader()
+            self._dl_local.downloader = downloader
+        return downloader
+
+    @staticmethod
+    def _is_retriable_reason(reason: str) -> bool:
+        return reason in {"timeout", "http_429", "http_5xx", "request_error"}
+
+    @staticmethod
+    def _classify_exception(exc: Exception) -> tuple[str, str]:
+        if isinstance(exc, requests.Timeout):
+            return ("timeout", str(exc))
+        if isinstance(exc, requests.HTTPError):
+            code = exc.response.status_code if exc.response is not None else None
+            if code == 429:
+                return ("http_429", f"HTTP {code}: {exc}")
+            if code is not None and 500 <= code < 600:
+                return ("http_5xx", f"HTTP {code}: {exc}")
+            return ("http_error", f"HTTP {code}: {exc}")
+        if isinstance(exc, requests.RequestException):
+            return ("request_error", str(exc))
+        return ("unexpected_error", str(exc))
+
+    @staticmethod
+    def _backoff_seconds(attempt: int) -> float:
+        raw = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+        jitter = random.uniform(0, RETRY_BACKOFF_BASE)
+        return min(RETRY_BACKOFF_CAP, raw + jitter)
+
+    def _respect_global_delay(self):
+        if DELAY_BETWEEN_DOWNLOADS <= 0:
+            return
+        with self._rate_lock:
+            now = time.monotonic()
+            wait_for = self._next_request_ts - now
+            if wait_for > 0:
+                time.sleep(wait_for)
+            self._next_request_ts = time.monotonic() + DELAY_BETWEEN_DOWNLOADS
+
+    def _reserve_output_name(self, dest: str, filename: str) -> str:
+        root, ext = os.path.splitext(filename)
+        n = 0
+        with self._name_lock:
+            while True:
+                candidate = filename if n == 0 else f"{root} ({n}){ext}"
+                candidate_path = os.path.join(dest, candidate)
+                key = candidate.lower()
+                if key not in self._reserved_names and not os.path.exists(candidate_path):
+                    self._reserved_names.add(key)
+                    return candidate
+                n += 1
+
+    def _release_output_name(self, filename: str):
+        with self._name_lock:
+            self._reserved_names.discard(filename.lower())
+
+    def _build_base_name(self, record: dict, response: requests.Response, index: int) -> str:
+        doc_name = record.get("Name", "")
+        if doc_name:
+            base_name = sanitize_filename(doc_name)
+            server_name = get_server_filename(response)
+            if server_name:
+                _, s_ext = os.path.splitext(server_name)
+                _, l_ext = os.path.splitext(base_name)
+                if s_ext and not l_ext:
+                    base_name += s_ext
+            return base_name
+
+        server_name = get_server_filename(response)
+        if server_name:
+            return sanitize_filename(server_name)
+        return f"document_{index:04d}.bin"
+
+    def _download_one(self, record: dict, dest: str, index: int, total: int) -> dict:
+        token = str(record.get("ID", "")).strip()
+        doc_name = record.get("Name", "")
+
+        if self._stop_event.is_set():
+            return {
+                "status": "stopped",
+                "reason": "stopped",
+                "error": "Stopped before start",
+                "attempts": 0,
+                "row": record,
+                "local_name": "",
+            }
+
+        if not token:
+            return {
+                "status": "fail",
+                "reason": "missing_token",
+                "error": "Document record did not include ID token",
+                "attempts": 0,
+                "row": record,
+                "local_name": "",
+            }
+
+        last_reason = "unexpected_error"
+        last_error = "Unknown error"
+        last_attempt = 0
+        local_name = ""
+
+        for attempt in range(1, MAX_RETRIES + 2):
+            last_attempt = attempt
+            if self._stop_event.is_set():
+                if local_name:
+                    self._release_output_name(local_name)
+                return {
+                    "status": "stopped",
+                    "reason": "stopped",
+                    "error": "Stopped by user",
+                    "attempts": attempt - 1,
+                    "row": record,
+                    "local_name": local_name,
+                }
+
+            response = None
+            try:
+                self._respect_global_delay()
+                downloader = self._get_thread_downloader()
+                response = downloader.fetch_document(token)
+                base_name = self._build_base_name(record, response, index)
+                local_name = self._reserve_output_name(dest, base_name)
+                out_path = os.path.join(dest, local_name)
+                downloader.write_atomic_stream(response, out_path)
+
+                self._post(("status", f"Downloaded {index} of {total}:  {doc_name or local_name}"))
+                return {
+                    "status": "ok",
+                    "reason": "success",
+                    "error": "",
+                    "attempts": attempt,
+                    "row": record,
+                    "local_name": local_name,
+                }
+
+            except Exception as exc:
+                if local_name:
+                    self._release_output_name(local_name)
+                    local_name = ""
+                last_reason, last_error = self._classify_exception(exc)
+
+            finally:
+                if response is not None:
+                    response.close()
+
+            if attempt <= MAX_RETRIES and self._is_retriable_reason(last_reason):
+                delay = self._backoff_seconds(attempt)
+                self._post((
+                    "status",
+                    f"Retrying {doc_name or token} ({attempt}/{MAX_RETRIES}) after {delay:.1f}s: {last_reason}",
+                ))
+                time.sleep(delay)
+                continue
+
+            break
+
+        return {
+            "status": "fail",
+            "reason": last_reason,
+            "error": last_error,
+            "attempts": last_attempt,
+            "row": record,
+            "local_name": local_name,
+        }
+
+    def _run_download_pass(self, records: list[dict], dest: str) -> dict:
+        total = len(records)
+        workers = self._compute_worker_count(total)
+        completed = 0
+        ok = 0
+        fail = 0
+        stopped = 0
+        failed_records = []
+
+        self._post(("progress_reset", total))
+        self._post(("status", f"Downloading {total} file(s) with {workers} worker(s)…"))
+
+        cancelled_futures = False
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ndwee-dl") as pool:
+            futures = [
+                pool.submit(self._download_one, record, dest, i, total)
+                for i, record in enumerate(records, start=1)
+            ]
+
+            for future in as_completed(futures):
+                if self._stop_event.is_set() and not cancelled_futures:
+                    cancelled_futures = True
+                    for pending in futures:
+                        pending.cancel()
+
+                if future.cancelled():
+                    stopped += 1
+                else:
+                    try:
+                        result = future.result()
+                        status = result.get("status", "fail")
+                        if status == "ok":
+                            ok += 1
+                        elif status == "stopped":
+                            stopped += 1
+                            failed_records.append(result)
+                        else:
+                            fail += 1
+                            failed_records.append(result)
+                    except Exception as exc:
+                        fail += 1
+                        failed_records.append({
+                            "status": "fail",
+                            "reason": "worker_crash",
+                            "error": str(exc),
+                            "attempts": 0,
+                            "row": {},
+                            "local_name": "",
+                        })
+
+                completed += 1
+                self._post(("progress", completed, total))
+
+        return {
+            "total": total,
+            "ok": ok,
+            "fail": fail,
+            "stopped": stopped,
+            "failed_records": failed_records,
+        }
+
+    def _write_failed_rows(self, dest: str, failed_records: list[dict]) -> str | None:
+        if not failed_records:
+            return None
+
+        out_path = os.path.join(dest, "failed_rows.csv")
+        all_fields = []
+        seen = set()
+        for rec in failed_records:
+            row = rec.get("row", {})
+            for key in row.keys():
+                if key not in seen:
+                    seen.add(key)
+                    all_fields.append(key)
+
+        all_fields += ["_reason", "_error", "_attempts", "_local_name"]
+        with open(out_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=all_fields)
+            writer.writeheader()
+            for rec in failed_records:
+                out_row = dict(rec.get("row", {}))
+                out_row["_reason"] = rec.get("reason", "")
+                out_row["_error"] = rec.get("error", "")
+                out_row["_attempts"] = rec.get("attempts", 0)
+                out_row["_local_name"] = rec.get("local_name", "")
+                writer.writerow(out_row)
+
+        return out_path
+
     def _download_worker(self, records, dest):
         os.makedirs(dest, exist_ok=True)
-        total = len(records)
-
-        with requests.Session() as session:
-            for i, record in enumerate(records, start=1):
-                token    = record["ID"]
-                doc_name = record.get("Name", "")
-                url      = DOC_URL.format(token=token)
-
-                self._post(("status", f"Downloading {i} of {total}:  {doc_name or '…'}"))
-                self._post(("progress", i, total))
-
-                try:
-                    response = session.get(url, headers=HEADERS, timeout=60, stream=True)
-                    response.raise_for_status()
-                except requests.RequestException as exc:
-                    self._post(("status", f"ERROR on file {i}: {exc}"))
-                    time.sleep(DELAY_BETWEEN_DOWNLOADS)
-                    continue
-
-                # Build filename
-                if doc_name:
-                    base_name   = sanitize_filename(doc_name)
-                    server_name = get_server_filename(response)
-                    if server_name:
-                        _, s_ext = os.path.splitext(server_name)
-                        _, l_ext = os.path.splitext(base_name)
-                        if s_ext and not l_ext:
-                            base_name += s_ext
-                else:
-                    server_name = get_server_filename(response)
-                    base_name   = sanitize_filename(server_name) if server_name else f"document_{i:04d}.bin"
-
-                filepath = os.path.join(dest, base_name)
-                if os.path.exists(filepath):
-                    root, ext = os.path.splitext(base_name)
-                    filepath  = os.path.join(dest, f"{root}_{i:04d}{ext}")
-
-                with open(filepath, "wb") as fh:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        fh.write(chunk)
-
-                if i < total:
-                    time.sleep(DELAY_BETWEEN_DOWNLOADS)
-
-        self._post(("done", total, dest))
+        summary = self._run_download_pass(records, dest)
+        failed_csv = self._write_failed_rows(dest, summary["failed_records"])
+        summary["dest"] = dest
+        summary["failed_csv"] = failed_csv
+        self._post(("done", summary))
 
     # ── Queue / thread-safe UI updates ────────────────────────────────────────
 
@@ -356,6 +664,11 @@ class App(tk.Tk):
                     self.progress_var.set(pct)
                     self.count_label.config(text=f"{i} / {total} files")
 
+                elif kind == "progress_reset":
+                    total = msg[1]
+                    self.progress_var.set(0)
+                    self.count_label.config(text=f"0 / {total} files")
+
                 elif kind == "confirm":
                     _, count, truncated, records, dest = msg
                     self.download_btn.config(state="normal")
@@ -371,30 +684,62 @@ class App(tk.Tk):
                     )
                     if proceed:
                         self.download_btn.config(state="disabled")
+                        self.stop_btn.config(state="normal")
                         self._set_status("Starting download…")
                         self.count_label.config(text=f"0 / {count} files")
                         self._do_download(records, dest)
                     else:
                         self._set_status("Download cancelled.")
+                        self.stop_btn.config(state="disabled")
+                        self.download_btn.config(state="normal")
                         self.progress_var.set(0)
                         self.count_label.config(text="")
 
                 elif kind == "done":
-                    _, total, dest = msg
-                    self.progress_var.set(100)
+                    summary = msg[1]
+                    total = summary["total"]
+                    ok = summary["ok"]
+                    fail = summary["fail"]
+                    stopped = summary["stopped"]
+                    dest = summary["dest"]
+                    failed_csv = summary.get("failed_csv")
+
+                    self.progress_var.set(100 if total else 0)
                     self.count_label.config(text=f"{total} / {total} files")
-                    self._set_status(f"✓  Done. {total} file(s) saved to:\n{dest}")
                     self.download_btn.config(state="normal")
-                    messagebox.showinfo("Download Complete",
-                                        f"Successfully downloaded {total} file(s).\n\nSaved to:\n{dest}")
+                    self.stop_btn.config(state="disabled")
+
+                    if stopped and not fail:
+                        self._set_status(
+                            f"Stopped. {ok} succeeded, {stopped} stopped.\nSaved to:\n{dest}"
+                        )
+                    elif fail or stopped:
+                        extra = f"\nFailed rows file:\n{failed_csv}" if failed_csv else ""
+                        self._set_status(
+                            f"Finished with issues. {ok} succeeded, {fail} failed, {stopped} stopped.\nSaved to:\n{dest}{extra}"
+                        )
+                    else:
+                        self._set_status(f"✓  Done. {ok} file(s) saved to:\n{dest}")
+
+                    details = [
+                        f"Succeeded: {ok}",
+                        f"Failed: {fail}",
+                        f"Stopped: {stopped}",
+                        f"Saved to:\n{dest}",
+                    ]
+                    if failed_csv:
+                        details.append(f"Failed rows CSV:\n{failed_csv}")
+                    messagebox.showinfo("Download Complete", "\n\n".join(details))
 
                 elif kind == "done_none":
                     self._set_status("No documents found for the given filters.")
                     self.download_btn.config(state="normal")
+                    self.stop_btn.config(state="disabled")
 
                 elif kind == "error":
                     self._set_status(f"Error: {msg[1]}")
                     self.download_btn.config(state="normal")
+                    self.stop_btn.config(state="disabled")
                     messagebox.showerror("Error", msg[1])
 
         except queue.Empty:

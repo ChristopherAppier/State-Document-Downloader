@@ -15,6 +15,7 @@ USAGE:
 """
 
 import csv
+import random
 import re
 import threading
 import time
@@ -28,6 +29,11 @@ try:
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
+
+MAX_RETRIES = 5
+RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRY_BACKOFF_BASE = 0.5
+RETRY_BACKOFF_CAP = 8.0
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -78,6 +84,31 @@ def load_csv(path: str) -> list[dict]:
                 'status': row.get('DocMgmtRefDocStatTypeDescr', '').strip(),
             })
     return documents
+
+
+def is_retriable_reason(reason: str) -> bool:
+    return reason in {'timeout', 'http_429', 'http_5xx', 'request_error'}
+
+
+def classify_exception(exc: Exception) -> tuple[str, str]:
+    if HAS_REQUESTS and isinstance(exc, requests.Timeout):
+        return ('timeout', str(exc))
+    if HAS_REQUESTS and isinstance(exc, requests.HTTPError):
+        code = exc.response.status_code if exc.response is not None else None
+        if code == 429:
+            return ('http_429', f'HTTP {code}: {exc}')
+        if code is not None and 500 <= code < 600:
+            return ('http_5xx', f'HTTP {code}: {exc}')
+        return ('http_error', f'HTTP {code}: {exc}')
+    if HAS_REQUESTS and isinstance(exc, requests.RequestException):
+        return ('request_error', str(exc))
+    return ('unexpected_error', str(exc))
+
+
+def backoff_seconds(attempt: int) -> float:
+    raw = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+    jitter = random.uniform(0, RETRY_BACKOFF_BASE)
+    return min(RETRY_BACKOFF_CAP, raw + jitter)
 
 # ── Main application ──────────────────────────────────────────────────────────
 
@@ -377,16 +408,45 @@ class App(tk.Tk):
 
             self._set_status(f'({i}/{len(docs)}) Downloading: {doc["name"][:60]}')
 
-            try:
-                response = session.get(doc['url'], stream=True, timeout=60)
-                response.raise_for_status()
-                with open(filepath, 'wb') as fh:
-                    for chunk in response.iter_content(chunk_size=16_384):
-                        fh.write(chunk)
-                success += 1
-            except Exception as exc:
+            download_ok = False
+            last_error = 'Unknown failure'
+            last_reason = 'unexpected_error'
+
+            for attempt in range(1, MAX_RETRIES + 2):
+                if self._cancel_flag:
+                    break
+
+                try:
+                    if attempt > 1:
+                        self._set_status(
+                            f'({i}/{len(docs)}) Retry {attempt - 1}/{MAX_RETRIES}: {doc["name"][:50]}'
+                        )
+
+                    response = session.get(doc['url'], stream=True, timeout=60)
+                    response.raise_for_status()
+                    with open(filepath, 'wb') as fh:
+                        for chunk in response.iter_content(chunk_size=16_384):
+                            if chunk:
+                                fh.write(chunk)
+
+                    download_ok = True
+                    success += 1
+                    break
+                except Exception as exc:
+                    last_reason, last_error = classify_exception(exc)
+                    if attempt <= MAX_RETRIES and is_retriable_reason(last_reason):
+                        delay = backoff_seconds(attempt)
+                        self._set_status(
+                            f'({i}/{len(docs)}) RETRYING in {delay:.2f}s: '
+                            f'{doc["name"][:40]} ({last_reason})'
+                        )
+                        time.sleep(delay)
+                        continue
+                    break
+
+            if not download_ok and not self._cancel_flag:
                 failed += 1
-                self._set_status(f'({i}/{len(docs)}) FAILED: {doc["name"][:50]} — {exc}')
+                self._set_status(f'({i}/{len(docs)}) FAILED: {doc["name"][:50]} — {last_error}')
                 time.sleep(0.5)
 
             self._set_progress(i)

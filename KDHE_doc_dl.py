@@ -85,8 +85,10 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('KDHE Document Batch Downloader')
+        self.geometry('1060x720')
         self.resizable(True, True)
         self.minsize(900, 580)
+        self.configure(bg='#f2f2f2')
 
         self.documents: list[dict] = []
         self._cancel_flag = False
@@ -100,49 +102,30 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {'padx': 8, 'pady': 4}
 
-        # ── Instructions banner ───────────────────────────────────────────────
-        banner = ttk.Label(
-            self,
-            text=(
-                'To use this application, open the facility page in KEIMS, select the '
-                'Documents tab, and use the "Download as CSV" option to export the document '
-                'list. Then load that CSV file below.'
-            ),
-            wraplength=860,
-            justify='left',
-            relief='groove',
-            padding=8,
-        )
-        banner.grid(row=0, column=0, sticky='ew', padx=8, pady=(8, 2))
+        # ── Step 1: CSV load ──────────────────────────────────────────────────
+        step1 = ttk.LabelFrame(self, text='Step 1 - Load KDHE documents CSV', padding=8)
+        step1.pack(fill='x', padx=12, pady=(12, 4))
 
-        # ── File selection frame ──────────────────────────────────────────────
-        file_frame = ttk.LabelFrame(self, text='Files', padding=8)
-        file_frame.grid(row=1, column=0, sticky='ew', **pad)
-        self.columnconfigure(0, weight=1)
-
-        ttk.Label(file_frame, text='CSV file:').grid(row=0, column=0, sticky='w')
+        ttk.Button(step1, text='Browse CSV...', command=self._browse_csv).pack(side='left', **pad)
         self.csv_var = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self.csv_var, width=70).grid(
-            row=0, column=1, sticky='ew', padx=(4, 4))
-        ttk.Button(file_frame, text='Browse…', command=self._browse_csv).grid(
-            row=0, column=2)
+        csv_entry = ttk.Entry(step1, textvariable=self.csv_var, width=72)
+        csv_entry.pack(side='left', fill='x', expand=True, **pad)
+        csv_entry.bind('<Return>', lambda _: self._load_documents())
 
-        ttk.Label(file_frame, text='Save to:').grid(row=1, column=0, sticky='w', pady=(6, 0))
-        self.out_var = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self.out_var, width=70).grid(
-            row=1, column=1, sticky='ew', padx=(4, 4), pady=(6, 0))
-        ttk.Button(file_frame, text='Browse…', command=self._browse_output).grid(
-            row=1, column=2, pady=(6, 0))
+        # ── Step 2: Document table ────────────────────────────────────────────
+        step2 = ttk.LabelFrame(self, text='Step 2 - Select documents to download', padding=8)
+        step2.pack(fill='both', expand=True, padx=12, pady=4)
 
-        file_frame.columnconfigure(1, weight=1)
+        toolbar = ttk.Frame(step2)
+        toolbar.pack(fill='x', pady=(0, 4))
 
-        ttk.Button(file_frame, text='Load Documents', command=self._load_documents).grid(
-            row=2, column=0, columnspan=3, pady=(10, 2))
+        ttk.Button(toolbar, text='Select All', command=self._select_all).pack(side='left', padx=4)
+        ttk.Button(toolbar, text='Deselect All', command=self._deselect_all).pack(side='left', padx=4)
+        self.selection_label = ttk.Label(toolbar, text='0 documents loaded')
+        self.selection_label.pack(side='right', padx=6)
 
-        # ── Document table ────────────────────────────────────────────────────
-        table_frame = ttk.LabelFrame(self, text='Documents', padding=8)
-        table_frame.grid(row=2, column=0, sticky='nsew', **pad)
-        self.rowconfigure(2, weight=1)
+        table_frame = ttk.Frame(step2)
+        table_frame.pack(fill='both', expand=True)
 
         columns = ('name', 'source_type', 'description', 'date')
         headings = ('Filename', 'Source Type', 'Description', 'Date Received')
@@ -173,39 +156,47 @@ class App(tk.Tk):
         self.context_menu.add_command(label='Deselect all', command=self._deselect_all)
         self.tree.bind('<Button-3>', self._show_context_menu)
 
-        # ── Selection info + download controls ───────────────────────────────
+        # ── Step 3: Output folder ─────────────────────────────────────────────
+        step3 = ttk.LabelFrame(self, text='Step 3 - Output folder', padding=8)
+        step3.pack(fill='x', padx=12, pady=4)
+
+        self.out_var = tk.StringVar(value=str(Path.home() / 'Downloads'))
+        ttk.Entry(step3, textvariable=self.out_var, width=72).pack(
+            side='left', fill='x', expand=True, **pad
+        )
+        ttk.Button(step3, text='Browse...', command=self._browse_output).pack(side='left', **pad)
+
+        # ── Download controls ─────────────────────────────────────────────────
         ctrl_frame = ttk.Frame(self)
-        ctrl_frame.grid(row=3, column=0, sticky='ew', **pad)
-        ctrl_frame.columnconfigure(1, weight=1)
+        ctrl_frame.pack(fill='x', padx=12, pady=4)
 
-        self.selection_label = ttk.Label(ctrl_frame, text='No documents loaded.')
-        self.selection_label.grid(row=0, column=0, sticky='w')
-
-        btn_frame = ttk.Frame(ctrl_frame)
-        btn_frame.grid(row=0, column=2, sticky='e')
-
-        ttk.Button(btn_frame, text='Select All',
-                   command=self._select_all).pack(side='left', padx=3)
-        ttk.Button(btn_frame, text='Deselect All',
-                   command=self._deselect_all).pack(side='left', padx=3)
         self.download_btn = ttk.Button(
-            btn_frame, text='Download Selected',
-            command=self._start_download, state='disabled')
-        self.download_btn.pack(side='left', padx=3)
+            ctrl_frame,
+            text='⬇ Download Selected',
+            command=self._start_download,
+            state='disabled'
+        )
+        self.download_btn.pack(side='left', padx=4)
+
         self.cancel_btn = ttk.Button(
-            btn_frame, text='Cancel',
-            command=self._cancel_download, state='disabled')
-        self.cancel_btn.pack(side='left', padx=3)
+            ctrl_frame,
+            text='⏹ Cancel',
+            command=self._cancel_download,
+            state='disabled'
+        )
+        self.cancel_btn.pack(side='left', padx=4)
+
+        self.progress = ttk.Progressbar(ctrl_frame, orient='horizontal', mode='determinate', length=380)
+        self.progress.pack(side='left', padx=8)
+
+        self.progress_label = ttk.Label(ctrl_frame, text='0 / 0')
+        self.progress_label.pack(side='left')
 
         self.tree.bind('<<TreeviewSelect>>', lambda _: self._update_selection_label())
 
-        # ── Progress bar + status ─────────────────────────────────────────────
+        # ── Status ─────────────────────────────────────────────────────────────
         prog_frame = ttk.Frame(self)
-        prog_frame.grid(row=4, column=0, sticky='ew', **pad)
-        prog_frame.columnconfigure(0, weight=1)
-
-        self.progress = ttk.Progressbar(prog_frame, orient='horizontal', mode='determinate')
-        self.progress.grid(row=0, column=0, sticky='ew', pady=(0, 4))
+        prog_frame.pack(fill='x', padx=12, pady=(0, 8))
 
         self.status_var = tk.StringVar(value='Ready.')
         ttk.Label(prog_frame, textvariable=self.status_var, anchor='w').grid(
@@ -231,6 +222,7 @@ class App(tk.Tk):
         )
         if path:
             self.csv_var.set(path)
+            self._load_documents()
 
     def _browse_output(self):
         path = filedialog.askdirectory(title='Select download folder')
@@ -289,7 +281,7 @@ class App(tk.Tk):
         total = len(self.tree.get_children())
         selected = len(self.tree.selection())
         if total == 0:
-            self.selection_label.config(text='No documents loaded.')
+            self.selection_label.config(text='0 documents loaded')
         else:
             self.selection_label.config(text=f'{selected} of {total} selected.')
 
@@ -339,6 +331,7 @@ class App(tk.Tk):
         self.cancel_btn.config(state='normal')
         self.progress['value'] = 0
         self.progress['maximum'] = len(selected_docs)
+        self.progress_label.config(text=f'0 / {len(selected_docs)}')
 
         self._download_thread = threading.Thread(
             target=self._download_worker,
@@ -405,11 +398,20 @@ class App(tk.Tk):
         self.after(0, lambda: self.status_var.set(msg))
 
     def _set_progress(self, value: int):
-        self.after(0, lambda: self.progress.configure(value=value))
+        def update_progress():
+            self.progress.configure(value=value)
+            total = int(float(self.progress.cget('maximum')))
+            self.progress_label.config(text=f'{value} / {total}')
+
+        self.after(0, update_progress)
 
     def _download_finished(self, success: int, failed: int, skipped: int, out_path: Path):
         self.download_btn.config(state='normal')
         self.cancel_btn.config(state='disabled')
+        completed = success + failed
+        total = int(float(self.progress.cget('maximum')))
+        self.progress.configure(value=completed)
+        self.progress_label.config(text=f'{completed} / {total}')
 
         parts = [f'{success} downloaded']
         if failed:
@@ -418,14 +420,6 @@ class App(tk.Tk):
             parts.append(f'{skipped} cancelled')
         summary = ', '.join(parts) + f'.  Saved to: {out_path}'
         self.status_var.set(summary)
-
-        if failed == 0 and skipped == 0:
-            messagebox.showinfo('Done', f'All {success} files downloaded successfully.\n\n{out_path}')
-        else:
-            messagebox.showwarning(
-                'Download complete',
-                f'{success} downloaded, {failed} failed, {skipped} skipped.\n\nSaved to:\n{out_path}'
-            )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

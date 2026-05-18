@@ -165,6 +165,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ECMP Nebraska Bulk Downloader")
+        self.geometry("980x760")
         self.resizable(False, False)
         self._msg_queue = queue.Queue()
         self._stop_event = threading.Event()
@@ -173,6 +174,9 @@ class App(tk.Tk):
         self._next_request_ts = 0.0
         self._name_lock = threading.Lock()
         self._reserved_names = set()
+        self._result_records: list[dict] = []
+        self._results_columns: list[str] = []
+        self._results_truncated = False
         self._build_ui()
         self._poll_queue()
 
@@ -228,16 +232,51 @@ class App(tk.Tk):
         # ── Action buttons
         action_row = ttk.Frame(self)
         action_row.grid(row=2, column=0, pady=(6, 4))
-        self.download_btn = ttk.Button(
-            action_row, text="Search & Download", command=self._start, width=24)
-        self.download_btn.pack(side="left", padx=(0, 6))
+        self.search_btn = ttk.Button(
+            action_row, text="Search", command=self._start_search, width=18)
+        self.search_btn.pack(side="left", padx=(0, 6))
+        self.download_selected_btn = ttk.Button(
+            action_row, text="Download Selected", command=self._start_download_selected,
+            width=18, state="disabled")
+        self.download_selected_btn.pack(side="left", padx=(0, 6))
         self.stop_btn = ttk.Button(
             action_row, text="Stop", command=self._stop_download, width=10, state="disabled")
         self.stop_btn.pack(side="left")
 
+        # ── Search results frame
+        results_frm = ttk.LabelFrame(self, text="Search Results", padding=12)
+        results_frm.grid(row=3, column=0, sticky="ew", padx=16, pady=(2, 4))
+
+        results_actions = ttk.Frame(results_frm)
+        results_actions.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(results_actions, text="Select All", command=self._select_all_results).pack(
+            side="left", padx=(0, 6))
+        ttk.Button(results_actions, text="Deselect All", command=self._deselect_all_results).pack(
+            side="left")
+        self.results_count_label = ttk.Label(results_actions, text="No results loaded")
+        self.results_count_label.pack(side="right")
+
+        tree_wrap = ttk.Frame(results_frm)
+        tree_wrap.grid(row=1, column=0, sticky="nsew")
+        results_frm.rowconfigure(1, weight=1)
+        results_frm.columnconfigure(0, weight=1)
+
+        self.results_tree = ttk.Treeview(tree_wrap, show="headings", selectmode="extended", height=12)
+        self.results_tree.grid(row=0, column=0, sticky="nsew")
+        self.results_tree.bind("<<TreeviewSelect>>", lambda _: self._update_selection_count())
+        self.results_tree.bind("<Configure>", self._on_results_tree_resize)
+
+        tree_vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.results_tree.yview)
+        tree_hsb = ttk.Scrollbar(tree_wrap, orient="horizontal", command=self.results_tree.xview)
+        self.results_tree.configure(yscrollcommand=tree_vsb.set, xscrollcommand=tree_hsb.set)
+        tree_vsb.grid(row=0, column=1, sticky="ns")
+        tree_hsb.grid(row=1, column=0, sticky="ew")
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+
         # ── Progress frame
         prog_frm = ttk.LabelFrame(self, text="Progress", padding=12)
-        prog_frm.grid(row=3, column=0, sticky="ew", padx=16, pady=(4, 14))
+        prog_frm.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 14))
         prog_frm.columnconfigure(0, weight=1)
 
         self.progress_var = tk.DoubleVar(value=0)
@@ -291,6 +330,91 @@ class App(tk.Tk):
         if folder:
             self.dest_var.set(folder)
 
+    # ── Results list helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _find_record_key(records: list[dict], candidates: list[str]) -> str | None:
+        for record in records:
+            by_lower = {str(k).lower(): k for k in record.keys()}
+            for candidate in candidates:
+                found = by_lower.get(candidate.lower())
+                if found:
+                    return found
+        return None
+
+    def _derive_results_columns(self, records: list[dict]) -> list[tuple[str, str, int]]:
+        name_key = self._find_record_key(records, ["Name"]) or "Name"
+        return [(name_key, "Document Name", 900)]
+
+    def _clear_results(self):
+        self._result_records = []
+        self._results_columns = []
+        for iid in self.results_tree.get_children():
+            self.results_tree.delete(iid)
+        self.results_tree.configure(columns=())
+        self.results_count_label.config(text="No results loaded")
+        self.download_selected_btn.config(state="disabled")
+
+    def _on_results_tree_resize(self, _event=None):
+        if not self._results_columns:
+            return
+        name_col = self._results_columns[0]
+        # Keep one-column table filling the visible widget width.
+        width = max(200, self.results_tree.winfo_width() - 6)
+        self.results_tree.column(name_col, width=width, stretch=True)
+
+    def _populate_results(self, records: list[dict]):
+        self._clear_results()
+        self._result_records = list(records)
+
+        column_defs = self._derive_results_columns(self._result_records)
+        column_keys = [key for key, _, _ in column_defs]
+        self._results_columns = column_keys
+
+        self.results_tree.configure(columns=tuple(column_keys))
+        for key, heading, width in column_defs:
+            self.results_tree.heading(key, text=heading)
+            self.results_tree.column(key, width=width, anchor="w", stretch=(key == column_keys[0]))
+
+        for idx, record in enumerate(self._result_records):
+            values = [str(record.get(key, "")) for key in column_keys]
+            self.results_tree.insert("", "end", iid=str(idx), values=values)
+
+        self._on_results_tree_resize()
+
+        children = self.results_tree.get_children()
+        if children:
+            self.results_tree.selection_set(children)
+        self._update_selection_count()
+        self.download_selected_btn.config(state="normal" if children else "disabled")
+
+    def _selected_records(self) -> list[dict]:
+        selected = []
+        for iid in self.results_tree.selection():
+            try:
+                selected.append(self._result_records[int(iid)])
+            except (ValueError, IndexError):
+                continue
+        return selected
+
+    def _select_all_results(self):
+        children = self.results_tree.get_children()
+        if children:
+            self.results_tree.selection_set(children)
+            self._update_selection_count()
+
+    def _deselect_all_results(self):
+        self.results_tree.selection_remove(self.results_tree.get_children())
+        self._update_selection_count()
+
+    def _update_selection_count(self):
+        total = len(self._result_records)
+        selected = len(self.results_tree.selection())
+        if total == 0:
+            self.results_count_label.config(text="No results loaded")
+        else:
+            self.results_count_label.config(text=f"{selected} of {total} selected")
+
     # ── Validation ────────────────────────────────────────────────────────────
 
     def _validate(self) -> bool:
@@ -313,16 +437,15 @@ class App(tk.Tk):
             return False
         return True
 
-    # ── Start download flow ───────────────────────────────────────────────────
+    # ── Search / download flow ───────────────────────────────────────────────
 
-    def _start(self):
+    def _start_search(self):
         if not self._validate():
             return
 
         facility  = self.facility_var.get().strip()
         from_date = self._get_date(self.from_var)
         to_date   = self._get_date(self.to_var)
-        dest      = self.dest_var.get().strip()
 
         self._stop_event.clear()
         self.stop_btn.config(state="disabled")
@@ -330,22 +453,53 @@ class App(tk.Tk):
         with self._name_lock:
             self._reserved_names.clear()
 
-        self.download_btn.config(state="disabled")
+        self.search_btn.config(state="disabled")
+        self.download_selected_btn.config(state="disabled")
         self._set_status("Querying ECMP API…")
         self.progress_var.set(0)
         self.count_label.config(text="")
+        self._clear_results()
 
         threading.Thread(
             target=self._worker,
-            args=(facility, from_date, to_date, dest),
+            args=(facility, from_date, to_date),
             daemon=True,
         ).start()
 
+    def _start_download_selected(self):
+        records = self._selected_records()
+        if not records:
+            messagebox.showwarning("Nothing selected", "Select at least one document to download.")
+            return
+
+        dest = self.dest_var.get().strip()
+        if not dest:
+            messagebox.showwarning("Missing input", "Please select a download folder.")
+            return
+
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Output folder error", str(exc))
+            return
+
+        self._stop_event.clear()
+        self._next_request_ts = 0.0
+        with self._name_lock:
+            self._reserved_names.clear()
+
+        self.search_btn.config(state="disabled")
+        self.download_selected_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.progress_var.set(0)
+        self.count_label.config(text=f"0 / {len(records)} files")
+        self._set_status("Starting selected download…")
+        self._do_download(records, dest)
+
     # ── Background worker ─────────────────────────────────────────────────────
 
-    def _worker(self, facility, from_date, to_date, dest):
+    def _worker(self, facility, from_date, to_date):
         try:
-            # Step 1: fetch document list
             self._post(("status", "Querying ECMP — please wait…"))
             records, truncated = fetch_document_list(facility, from_date, to_date)
 
@@ -353,14 +507,13 @@ class App(tk.Tk):
                 self._post(("done_none",))
                 return
 
-            # Step 2: confirm with user before downloading
-            self._post(("confirm", len(records), truncated, records, dest))
+            self._post(("results_loaded", records, truncated))
 
         except requests.RequestException as exc:
             self._post(("error", f"Network error:\n{exc}"))
 
     def _do_download(self, records, dest):
-        """Called from the main thread after user confirms. Spawns download thread."""
+        """Called from the main thread. Spawns download thread."""
         threading.Thread(
             target=self._download_worker,
             args=(records, dest),
@@ -669,31 +822,19 @@ class App(tk.Tk):
                     self.progress_var.set(0)
                     self.count_label.config(text=f"0 / {total} files")
 
-                elif kind == "confirm":
-                    _, count, truncated, records, dest = msg
-                    self.download_btn.config(state="normal")
-                    warn = (
-                        "\n\n⚠️  Results were truncated — not all documents returned.\n"
-                        "Consider narrowing your date range."
-                        if truncated else ""
-                    )
-                    proceed = messagebox.askyesno(
-                        "Confirm Download",
-                        f"Found {count} document(s) for the selected filters.{warn}\n\n"
-                        f"Download all {count} file(s) to:\n{dest}\n\nProceed?",
-                    )
-                    if proceed:
-                        self.download_btn.config(state="disabled")
-                        self.stop_btn.config(state="normal")
-                        self._set_status("Starting download…")
-                        self.count_label.config(text=f"0 / {count} files")
-                        self._do_download(records, dest)
-                    else:
-                        self._set_status("Download cancelled.")
-                        self.stop_btn.config(state="disabled")
-                        self.download_btn.config(state="normal")
-                        self.progress_var.set(0)
-                        self.count_label.config(text="")
+                elif kind == "results_loaded":
+                    _, records, truncated = msg
+                    self._results_truncated = bool(truncated)
+                    self._populate_results(records)
+                    self.search_btn.config(state="normal")
+                    self.stop_btn.config(state="disabled")
+                    self._set_status(f"Found {len(records)} document(s). Select files to download.")
+                    if self._results_truncated:
+                        messagebox.showwarning(
+                            "Results Truncated",
+                            "Search results were truncated, so not all documents were returned.\n"
+                            "Consider narrowing your date range."
+                        )
 
                 elif kind == "done":
                     summary = msg[1]
@@ -706,7 +847,10 @@ class App(tk.Tk):
 
                     self.progress_var.set(100 if total else 0)
                     self.count_label.config(text=f"{total} / {total} files")
-                    self.download_btn.config(state="normal")
+                    self.search_btn.config(state="normal")
+                    self.download_selected_btn.config(
+                        state="normal" if self.results_tree.get_children() else "disabled"
+                    )
                     self.stop_btn.config(state="disabled")
 
                     if stopped and not fail:
@@ -721,24 +865,18 @@ class App(tk.Tk):
                     else:
                         self._set_status(f"✓  Done. {ok} file(s) saved to:\n{dest}")
 
-                    details = [
-                        f"Succeeded: {ok}",
-                        f"Failed: {fail}",
-                        f"Stopped: {stopped}",
-                        f"Saved to:\n{dest}",
-                    ]
-                    if failed_csv:
-                        details.append(f"Failed rows CSV:\n{failed_csv}")
-                    messagebox.showinfo("Download Complete", "\n\n".join(details))
-
                 elif kind == "done_none":
+                    self._clear_results()
                     self._set_status("No documents found for the given filters.")
-                    self.download_btn.config(state="normal")
+                    self.search_btn.config(state="normal")
                     self.stop_btn.config(state="disabled")
 
                 elif kind == "error":
                     self._set_status(f"Error: {msg[1]}")
-                    self.download_btn.config(state="normal")
+                    self.search_btn.config(state="normal")
+                    self.download_selected_btn.config(
+                        state="normal" if self.results_tree.get_children() else "disabled"
+                    )
                     self.stop_btn.config(state="disabled")
                     messagebox.showerror("Error", msg[1])
 

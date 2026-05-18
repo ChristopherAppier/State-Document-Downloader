@@ -14,7 +14,9 @@ Usage:
 """
 
 import csv
+import datetime as dt
 import os
+import random
 import re
 import threading
 import time
@@ -27,6 +29,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Configuration — adjust if the site URL or endpoints change
@@ -52,6 +56,15 @@ PROGRAM_FILTER_MAP: dict[str, dict[str, str]] = {
 REQUEST_TIMEOUT   = 30   # seconds per HTTP request
 DOWNLOAD_TIMEOUT  = 120  # seconds for file download
 DELAY_BETWEEN     = 0.5  # seconds between downloads (be polite)
+
+CONNECT_TIMEOUT = 10
+SEARCH_TIMEOUT = (CONNECT_TIMEOUT, REQUEST_TIMEOUT)
+DOWNLOAD_STREAM_TIMEOUT = (CONNECT_TIMEOUT, DOWNLOAD_TIMEOUT)
+
+MAX_RETRIES = 5
+RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRY_BACKOFF_BASE = 0.5
+RETRY_BACKOFF_CAP = 8.0
 
 HEADERS = {
     "User-Agent": (
@@ -87,8 +100,25 @@ class Downloader:
         self._log = log_fn or (lambda msg: None)
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        self._configure_retries()
         self._csrf_token: str | None = None
         self._init_session()
+
+    def _configure_retries(self):
+        retry_cfg = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            status=2,
+            backoff_factor=0.4,
+            status_forcelist=sorted(RETRIABLE_STATUS_CODES),
+            allowed_methods=frozenset({"GET", "POST"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry_cfg)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     # ── Session bootstrap ─────────────────────────────────────────────────────
     def _init_session(self):
@@ -97,7 +127,7 @@ class Downloader:
         ASP.NET anti-forgery (CSRF) token.
         """
         try:
-            resp = self.session.get(SEARCH_PAGE_URL, timeout=REQUEST_TIMEOUT)
+            resp = self.session.get(SEARCH_PAGE_URL, timeout=SEARCH_TIMEOUT)
             self._csrf_token = self._extract_csrf(resp.text)
             if self._csrf_token:
                 self._log(f"[session] CSRF token acquired.")
@@ -274,9 +304,10 @@ class Downloader:
                     SEARCH_URL,
                     data=payload,
                     headers=ajax_headers,
-                    timeout=REQUEST_TIMEOUT,
+                    timeout=SEARCH_TIMEOUT,
                 )
                 if resp.status_code != 200:
+                    self._log(f"          [POST OTCSSearch] HTTP {resp.status_code}")
                     continue
 
                 oid = self._parse_datatables_json(resp.text, filename)
@@ -398,30 +429,40 @@ class Downloader:
         Returns the saved path, or None if the response looks like an error page.
         """
         url = f"{DOWNLOAD_URL}?name={filename}"
-        try:
-            resp = self.session.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT)
-            ct = resp.headers.get("Content-Type", "")
-            # Reject HTML error pages
-            if resp.status_code == 200 and "text/html" not in ct:
-                out = output_dir / (save_name or filename)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                with open(out, "wb") as f:
-                    for chunk in resp.iter_content(65536):
-                        f.write(chunk)
-                return out
-        except Exception:
-            pass
+        resp = self.session.get(url, stream=True, timeout=DOWNLOAD_STREAM_TIMEOUT)
+        resp.raise_for_status()
+        ct = resp.headers.get("Content-Type", "")
+        # Reject HTML error pages
+        if "text/html" not in ct:
+            out = output_dir / (save_name or filename)
+            self._write_atomic_stream(resp, out)
+            return out
         return None
 
     def _stream_download(self, url: str, filename: str, output_dir: Path) -> Path:
-        resp = self.session.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT)
+        resp = self.session.get(url, stream=True, timeout=DOWNLOAD_STREAM_TIMEOUT)
         resp.raise_for_status()
         out = output_dir / filename
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "wb") as f:
-            for chunk in resp.iter_content(65536):
-                f.write(chunk)
+        self._write_atomic_stream(resp, out)
         return out
+
+    @staticmethod
+    def _write_atomic_stream(resp: requests.Response, out: Path):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(out.suffix + ".part")
+        try:
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_content(65536):
+                    if chunk:
+                        f.write(chunk)
+            os.replace(tmp, out)
+        except Exception:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -455,6 +496,8 @@ class App(tk.Tk):
         self._next_request_ts = 0.0
         self._name_lock = threading.Lock()
         self._reserved_names: set[str] = set()
+        self._log_lock = threading.Lock()
+        self._run_log_path: Path | None = None
 
         self._build_ui()
         self._poll_queue()
@@ -627,6 +670,7 @@ class App(tk.Tk):
         self._next_request_ts = 0.0
         with self._name_lock:
             self._reserved_names.clear()
+        self._start_run_log(out, len(selected))
 
         self._write_log("Starting parallel downloader…\n")
 
@@ -648,9 +692,82 @@ class App(tk.Tk):
     def _get_thread_downloader(self) -> Downloader:
         dl = getattr(self._dl_local, "downloader", None)
         if dl is None:
-            dl = Downloader()
+            dl = Downloader(log_fn=self._q_log)
             self._dl_local.downloader = dl
         return dl
+
+    @staticmethod
+    def _is_retriable_reason(reason: str) -> bool:
+        return reason in {"timeout", "http_429", "http_5xx", "request_error"}
+
+    @staticmethod
+    def _classify_exception(exc: Exception) -> tuple[str, str]:
+        if isinstance(exc, requests.Timeout):
+            return ("timeout", str(exc))
+        if isinstance(exc, requests.HTTPError):
+            code = exc.response.status_code if exc.response is not None else None
+            if code == 429:
+                return ("http_429", f"HTTP {code}: {exc}")
+            if code is not None and 500 <= code < 600:
+                return ("http_5xx", f"HTTP {code}: {exc}")
+            return ("http_error", f"HTTP {code}: {exc}")
+        if isinstance(exc, requests.RequestException):
+            return ("request_error", str(exc))
+        return ("unexpected_error", str(exc))
+
+    @staticmethod
+    def _backoff_seconds(attempt: int) -> float:
+        raw = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+        jitter = random.uniform(0, RETRY_BACKOFF_BASE)
+        return min(RETRY_BACKOFF_CAP, raw + jitter)
+
+    def _start_run_log(self, out: Path, total: int):
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._run_log_path = out / f"idnr_run_{stamp}.log"
+        with self._log_lock:
+            with open(self._run_log_path, "w", encoding="utf-8") as f:
+                f.write(f"Run started: {dt.datetime.now().isoformat()}\n")
+                f.write(f"Selected rows: {total}\n")
+                f.write(f"Max retries per file: {MAX_RETRIES}\n\n")
+
+    def _write_failed_rows(self, out: Path, failed_records: list[dict]) -> Path | None:
+        if not failed_records:
+            return None
+
+        path = out / "failed_rows.csv"
+        all_fields: list[str] = []
+        seen: set[str] = set()
+        for rec in failed_records:
+            for key in rec["row"].keys():
+                if key not in seen:
+                    seen.add(key)
+                    all_fields.append(key)
+        all_fields += ["_reason", "_error", "_attempts", "_local_name"]
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=all_fields)
+            writer.writeheader()
+            for rec in failed_records:
+                out_row = dict(rec["row"])
+                out_row["_reason"] = rec["reason"]
+                out_row["_error"] = rec["error"]
+                out_row["_attempts"] = rec["attempts"]
+                out_row["_local_name"] = rec["local_name"]
+                writer.writerow(out_row)
+        return path
+
+    def _load_failed_rows(self, failed_path: Path) -> list[dict]:
+        if not failed_path.exists():
+            return []
+
+        rows: list[dict] = []
+        with open(failed_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                cleaned = {k: v for k, v in row.items() if not k.startswith("_")}
+                if cleaned.get(COL_VIEW, "").strip():
+                    rows.append(cleaned)
+        return rows
 
     def _respect_global_delay(self):
         if DELAY_BETWEEN <= 0:
@@ -681,9 +798,17 @@ class App(tk.Tk):
         with self._name_lock:
             self._reserved_names.discard(filename.lower())
 
-    def _download_one(self, row: dict, out: Path, index: int, total: int) -> tuple[str, str]:
+    def _download_one(self, row: dict, out: Path, index: int, total: int) -> dict:
         if self._stop_event.is_set():
-            return ("stopped", "")
+            return {
+                "status": "stopped",
+                "reason": "stopped",
+                "filename": "",
+                "row": row,
+                "error": "Stopped before start",
+                "attempts": 0,
+                "local_name": "",
+            }
 
         filename      = Downloader.filename_from_view(row.get(COL_VIEW,   ""))
         doc_id        = row.get(COL_DOCID,  "").strip()
@@ -696,62 +821,101 @@ class App(tk.Tk):
 
         self._q_log(f"[{index}/{total}] {filename}")
         self._q_log(f"          Facility={fac_id or '—'}  DocID={doc_id or '—'}  Type={doc_type or '—'}")
-        self._q_log(f"          Resolving objectID…")
 
-        try:
-            downloader = self._get_thread_downloader()
-            self._respect_global_delay()
-            obj_id = downloader.find_object_id(
-                filename, fac_id, doc_id, doc_type, program, notes, permit_number
-            )
+        last_reason = "unexpected_error"
+        last_error = "Unknown failure"
+        last_attempt = 0
 
+        for attempt in range(1, MAX_RETRIES + 2):
+            last_attempt = attempt
             if self._stop_event.is_set():
                 self._release_output_name(local_name)
-                return ("stopped", "")
+                return {
+                    "status": "stopped",
+                    "reason": "stopped",
+                    "filename": filename,
+                    "row": row,
+                    "error": "Stopped by user",
+                    "attempts": attempt - 1,
+                    "local_name": local_name,
+                }
 
-            if obj_id:
-                self._q_log(f"          objectID={obj_id}  →  downloading…")
+            try:
+                self._q_log(f"          Attempt {attempt}/{MAX_RETRIES + 1}: resolving objectID…")
+                downloader = self._get_thread_downloader()
                 self._respect_global_delay()
-                path = downloader.download_by_id(obj_id, filename, out, save_name=local_name)
-                if local_name != filename:
-                    self._q_log(f"          ↳ Saved as '{local_name}' to avoid overwrite")
-                self._q_log(f"          ✓ Saved: {path.name}  ({path.stat().st_size:,} bytes)")
-                return ("ok", filename)
+                obj_id = downloader.find_object_id(
+                    filename, fac_id, doc_id, doc_type, program, notes, permit_number
+                )
 
-            self._q_log(f"          objectID not found — trying name-only download…")
-            if self._stop_event.is_set():
-                self._release_output_name(local_name)
-                return ("stopped", "")
-            self._respect_global_delay()
-            path = downloader.download_by_name(filename, out, save_name=local_name)
-            if path:
-                if local_name != filename:
-                    self._q_log(f"          ↳ Saved as '{local_name}' to avoid overwrite")
-                self._q_log(f"          ✓ Saved (fallback): {path.name}  ({path.stat().st_size:,} bytes)")
-                return ("ok", filename)
+                if obj_id:
+                    self._q_log(f"          objectID={obj_id}  →  downloading…")
+                    self._respect_global_delay()
+                    path = downloader.download_by_id(obj_id, filename, out, save_name=local_name)
+                    if local_name != filename:
+                        self._q_log(f"          ↳ Saved as '{local_name}' to avoid overwrite")
+                    self._q_log(f"          ✓ Saved: {path.name}  ({path.stat().st_size:,} bytes)")
+                    return {
+                        "status": "ok",
+                        "reason": "success",
+                        "filename": filename,
+                        "row": row,
+                        "error": "",
+                        "attempts": attempt,
+                        "local_name": local_name,
+                    }
 
-            self._q_log(
-                f"          ✗ FAILED – could not resolve objectID.\n"
-                f"          Tip: open DevTools → Network, search for '{filename}',\n"
-                f"          copy the objectID from the download URL, and try again."
-            )
-            self._release_output_name(local_name)
-            return ("fail", filename)
+                self._q_log("          objectID not found — trying name-only download…")
+                self._respect_global_delay()
+                path = downloader.download_by_name(filename, out, save_name=local_name)
+                if path:
+                    if local_name != filename:
+                        self._q_log(f"          ↳ Saved as '{local_name}' to avoid overwrite")
+                    self._q_log(f"          ✓ Saved (fallback): {path.name}  ({path.stat().st_size:,} bytes)")
+                    return {
+                        "status": "ok",
+                        "reason": "success",
+                        "filename": filename,
+                        "row": row,
+                        "error": "",
+                        "attempts": attempt,
+                        "local_name": local_name,
+                    }
 
-        except requests.HTTPError as e:
-            self._q_log(f"          ✗ HTTP {e.response.status_code} – {e}")
-            self._release_output_name(local_name)
-            return ("fail", filename)
-        except Exception as e:
-            self._q_log(f"          ✗ ERROR – {e}")
-            self._release_output_name(local_name)
-            return ("fail", filename)
+                last_reason = "objectid_not_found"
+                last_error = "Could not resolve objectID and name-only fallback returned no file"
 
-    def _download_worker(self, rows: list[dict], out: Path):
+            except Exception as e:
+                last_reason, last_error = self._classify_exception(e)
+                self._q_log(f"          ✗ Attempt {attempt} failed ({last_reason}): {last_error}")
+
+            if attempt <= MAX_RETRIES and self._is_retriable_reason(last_reason):
+                delay = self._backoff_seconds(attempt)
+                self._q_log(f"          Retrying in {delay:.2f}s…")
+                time.sleep(delay)
+                continue
+
+            break
+
+        self._release_output_name(local_name)
+        return {
+            "status": "fail",
+            "reason": last_reason,
+            "filename": filename,
+            "row": row,
+            "error": last_error,
+            "attempts": last_attempt,
+            "local_name": local_name,
+        }
+
+    def _run_download_pass(self, rows: list[dict], out: Path, pass_label: str) -> dict:
         total = len(rows)
+        self.status_q.put(("progress_reset", total))
+
         ok = fail = stopped = completed = 0
+        failed_records: list[dict] = []
         workers = self._compute_worker_count(total)
-        self._q_log(f"Using {workers} worker thread(s).")
+        self._q_log(f"{pass_label}: using {workers} worker thread(s) for {total} row(s).")
 
         cancelled_futures = False
 
@@ -771,13 +935,16 @@ class App(tk.Tk):
                     stopped += 1
                 else:
                     try:
-                        status, _filename = fut.result()
+                        result = fut.result()
+                        status = result.get("status", "fail")
                         if status == "ok":
                             ok += 1
                         elif status == "stopped":
                             stopped += 1
+                            failed_records.append(result)
                         else:
                             fail += 1
+                            failed_records.append(result)
                     except Exception as e:
                         self._q_log(f"          ✗ ERROR – worker crashed: {e}")
                         fail += 1
@@ -785,12 +952,75 @@ class App(tk.Tk):
                 completed += 1
                 self.status_q.put(("progress", completed))
 
+        return {
+            "ok": ok,
+            "fail": fail,
+            "stopped": stopped,
+            "total": total,
+            "failed_records": failed_records,
+        }
+
+    def _download_worker(self, rows: list[dict], out: Path):
+        self._q_log("PASS 1: starting selected rows…")
+        pass1 = self._run_download_pass(rows, out, "PASS 1")
+
+        pass2 = {
+            "ok": 0,
+            "fail": 0,
+            "stopped": 0,
+            "total": 0,
+            "failed_records": [],
+        }
+
+        failed_path = self._write_failed_rows(out, pass1["failed_records"])
+        remaining_failed = pass1["failed_records"]
+
+        if failed_path and not self._stop_event.is_set():
+            try:
+                retry_rows = self._load_failed_rows(failed_path)
+            except Exception as e:
+                self._q_log(f"Could not reload failed_rows.csv for pass 2: {e}")
+                retry_rows = []
+
+            if retry_rows:
+                with self._name_lock:
+                    self._reserved_names.clear()
+
+                self._q_log(f"PASS 2: retrying {len(retry_rows)} failed row(s) from failed_rows.csv…")
+                pass2 = self._run_download_pass(retry_rows, out, "PASS 2")
+                remaining_failed = pass2["failed_records"]
+
+                if remaining_failed:
+                    self._write_failed_rows(out, remaining_failed)
+                    self._q_log(f"Failed rows after pass 2 saved to: {failed_path}")
+                else:
+                    try:
+                        failed_path.unlink()
+                        self._q_log("PASS 2 recovered all failed rows; removed failed_rows.csv")
+                    except Exception as e:
+                        self._q_log(f"PASS 2 recovered all rows, but could not remove failed_rows.csv: {e}")
+            else:
+                self._q_log("PASS 2: no retryable rows found in failed_rows.csv")
+
+        elif failed_path:
+            self._q_log(f"Failed rows saved to: {failed_path}")
+
         if self._stop_event.is_set():
             self._q_log(f"\n{'─' * 55}\nStopped by user.\n")
 
+        final_fail = len(remaining_failed)
+        total_ok = pass1["ok"] + pass2["ok"]
+        total_stopped = pass1["stopped"] + pass2["stopped"]
+        initial_total = pass1["total"]
+
+        if self._run_log_path:
+            self._q_log(f"Run log saved to: {self._run_log_path}")
+
         self._q_log(
             f"\n{'─' * 55}\n"
-            f"Complete:  {ok} succeeded,  {fail} failed,  {stopped} stopped  (of {total} selected)\n"
+            f"Pass 1:    {pass1['ok']} succeeded,  {pass1['fail']} failed,  {pass1['stopped']} stopped  (of {pass1['total']})\n"
+            f"Pass 2:    {pass2['ok']} recovered,   {pass2['fail']} failed,  {pass2['stopped']} stopped  (of {pass2['total']} retried)\n"
+            f"Final:     {total_ok} succeeded total,  {final_fail} remaining failed,  {total_stopped} stopped  (of {initial_total} selected)\n"
             f"Output:    {out}\n"
         )
         self.status_q.put(("done", None))
@@ -802,6 +1032,11 @@ class App(tk.Tk):
                 kind, value = self.status_q.get_nowait()
                 if kind == "log":
                     self._write_log(value + "\n")
+                elif kind == "progress_reset":
+                    total = int(value)
+                    self.progress["value"] = 0
+                    self.progress["maximum"] = max(1, total)
+                    self.prog_lbl.configure(text=f"0 / {total}")
                 elif kind == "progress":
                     self.progress["value"] = value
                     total = int(self.progress["maximum"])
@@ -817,9 +1052,13 @@ class App(tk.Tk):
         self.status_q.put(("log", msg))
 
     def _write_log(self, msg: str):
-        # Log panel intentionally removed from the UI.
-        # Keep this method as a no-op so existing log calls remain safe.
-        _ = msg
+        text = msg.rstrip("\n")
+        if self._run_log_path is None or not text:
+            return
+        stamp = dt.datetime.now().strftime("%H:%M:%S")
+        with self._log_lock:
+            with open(self._run_log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{stamp}] {text}\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

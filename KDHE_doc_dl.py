@@ -15,10 +15,13 @@ USAGE:
 """
 
 import csv
+import os
 import random
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Empty, Queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
@@ -34,6 +37,7 @@ MAX_RETRIES = 5
 RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 RETRY_BACKOFF_BASE = 0.5
 RETRY_BACKOFF_CAP = 8.0
+DEFAULT_WORKERS = 4
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -110,6 +114,10 @@ def backoff_seconds(attempt: int) -> float:
     jitter = random.uniform(0, RETRY_BACKOFF_BASE)
     return min(RETRY_BACKOFF_CAP, raw + jitter)
 
+
+class DownloadCancelled(Exception):
+    pass
+
 # ── Main application ──────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -122,11 +130,22 @@ class App(tk.Tk):
         self.configure(bg='#f2f2f2')
 
         self.documents: list[dict] = []
-        self._cancel_flag = False
+        self._cancel_event = threading.Event()
         self._download_thread: threading.Thread | None = None
+        self._status_q: Queue = Queue()
+        self._thread_local = threading.local()
+        self._name_lock = threading.Lock()
+        self._reserved_names: set[str] = set()
+        self._counter_lock = threading.Lock()
+        self._total = 0
+        self._completed = 0
+        self._success = 0
+        self._failed = 0
+        self._cancelled = 0
 
         self._build_ui()
         self._check_requests()
+        self._poll_ui_queue()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -357,12 +376,24 @@ class App(tk.Tk):
         selected_indices = {int(iid) for iid in selected_iids}
         selected_docs = [d for d in self.documents if d['index'] in selected_indices]
 
-        self._cancel_flag = False
+        self._cancel_event.clear()
+        with self._name_lock:
+            self._reserved_names.clear()
+        with self._counter_lock:
+            self._total = len(selected_docs)
+            self._completed = 0
+            self._success = 0
+            self._failed = 0
+            self._cancelled = 0
+
         self.download_btn.config(state='disabled')
         self.cancel_btn.config(state='normal')
         self.progress['value'] = 0
         self.progress['maximum'] = len(selected_docs)
         self.progress_label.config(text=f'0 / {len(selected_docs)}')
+
+        workers = min(DEFAULT_WORKERS, len(selected_docs))
+        self._enqueue_ui('status', f'Starting {workers} worker(s) for {len(selected_docs)} file(s)...')
 
         self._download_thread = threading.Thread(
             target=self._download_worker,
@@ -372,103 +403,187 @@ class App(tk.Tk):
         self._download_thread.start()
 
     def _cancel_download(self):
-        self._cancel_flag = True
-        self.status_var.set('Cancelling…')
+        self._cancel_event.set()
+        self.cancel_btn.config(state='disabled')
+        self._enqueue_ui('status', 'Cancelling...')
 
-    def _download_worker(self, docs: list[dict], out_path: Path):
-        session = requests.Session()
-        session.headers['User-Agent'] = (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/120.0.0.0 Safari/537.36'
-        )
+    def _enqueue_ui(self, kind: str, value=None):
+        self._status_q.put((kind, value))
 
-        success = 0
-        failed = 0
-        skipped = 0
+    def _poll_ui_queue(self):
+        try:
+            while True:
+                kind, value = self._status_q.get_nowait()
+                if kind == 'status':
+                    self.status_var.set(str(value))
+                elif kind == 'progress':
+                    completed, total = value
+                    self.progress.configure(value=completed, maximum=total)
+                    self.progress_label.config(text=f'{completed} / {total}')
+                elif kind == 'done':
+                    self._download_finished(value['success'], value['failed'], value['cancelled'], value['out_path'])
+        except Empty:
+            pass
+        self.after(100, self._poll_ui_queue)
 
-        for i, doc in enumerate(docs, start=1):
-            if self._cancel_flag:
-                skipped = len(docs) - i + 1
-                break
+    def _get_thread_session(self):
+        session = getattr(self._thread_local, 'session', None)
+        if session is None:
+            session = requests.Session()
+            session.headers['User-Agent'] = (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/120.0.0.0 Safari/537.36'
+            )
+            self._thread_local.session = session
+        return session
 
-            safe_name = sanitize_filename(doc['name'])
-            if not safe_name.lower().endswith('.pdf'):
-                safe_name += '.pdf'
+    def _reserve_output_path(self, out_path: Path, original_name: str) -> Path:
+        safe_name = sanitize_filename(original_name)
+        if not safe_name.lower().endswith('.pdf'):
+            safe_name += '.pdf'
 
-            filepath = out_path / safe_name
+        stem = Path(safe_name).stem
+        suffix = Path(safe_name).suffix
+        counter = 1
 
-            # Avoid overwriting: append _2, _3, etc.
-            if filepath.exists():
-                stem = filepath.stem
-                counter = 2
-                while filepath.exists():
-                    filepath = out_path / f'{stem}_{counter}.pdf'
-                    counter += 1
+        with self._name_lock:
+            while True:
+                candidate = safe_name if counter == 1 else f'{stem}_{counter}.{suffix.lstrip(".")}'
+                candidate_key = candidate.lower()
+                candidate_path = out_path / candidate
+                if candidate_key not in self._reserved_names and not candidate_path.exists():
+                    self._reserved_names.add(candidate_key)
+                    return candidate_path
+                counter += 1
 
-            self._set_status(f'({i}/{len(docs)}) Downloading: {doc["name"][:60]}')
+    def _release_output_path(self, filepath: Path):
+        with self._name_lock:
+            self._reserved_names.discard(filepath.name.lower())
 
-            download_ok = False
-            last_error = 'Unknown failure'
-            last_reason = 'unexpected_error'
+    @staticmethod
+    def _cleanup_partial_file(filepath: Path):
+        tmp_path = filepath.with_suffix(filepath.suffix + '.part')
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
 
+    def _download_one(self, doc: dict, out_path: Path, total: int) -> str:
+        if self._cancel_event.is_set():
+            return 'cancelled'
+
+        filepath = self._reserve_output_path(out_path, doc['name'])
+        tmp_path = filepath.with_suffix(filepath.suffix + '.part')
+        display_name = doc['name'][:60]
+        self._enqueue_ui('status', f'Downloading: {display_name}')
+
+        session = self._get_thread_session()
+        last_reason = 'unexpected_error'
+        last_error = 'Unknown failure'
+
+        try:
             for attempt in range(1, MAX_RETRIES + 2):
-                if self._cancel_flag:
-                    break
+                if self._cancel_event.is_set():
+                    raise DownloadCancelled('Cancelled by user')
 
                 try:
                     if attempt > 1:
-                        self._set_status(
-                            f'({i}/{len(docs)}) Retry {attempt - 1}/{MAX_RETRIES}: {doc["name"][:50]}'
+                        self._enqueue_ui(
+                            'status',
+                            f'Retry {attempt - 1}/{MAX_RETRIES}: {doc["name"][:50]}'
                         )
 
                     response = session.get(doc['url'], stream=True, timeout=60)
                     response.raise_for_status()
-                    with open(filepath, 'wb') as fh:
+                    with open(tmp_path, 'wb') as fh:
                         for chunk in response.iter_content(chunk_size=16_384):
+                            if self._cancel_event.is_set():
+                                raise DownloadCancelled('Cancelled during download stream')
                             if chunk:
                                 fh.write(chunk)
 
-                    download_ok = True
-                    success += 1
-                    break
+                    os.replace(tmp_path, filepath)
+                    return 'success'
+                except DownloadCancelled:
+                    raise
                 except Exception as exc:
+                    self._cleanup_partial_file(filepath)
                     last_reason, last_error = classify_exception(exc)
                     if attempt <= MAX_RETRIES and is_retriable_reason(last_reason):
                         delay = backoff_seconds(attempt)
-                        self._set_status(
-                            f'({i}/{len(docs)}) RETRYING in {delay:.2f}s: '
-                            f'{doc["name"][:40]} ({last_reason})'
+                        self._enqueue_ui(
+                            'status',
+                            f'RETRYING in {delay:.2f}s: {doc["name"][:40]} ({last_reason})'
                         )
-                        time.sleep(delay)
+                        if self._cancel_event.wait(delay):
+                            raise DownloadCancelled('Cancelled during retry backoff')
                         continue
                     break
+        except DownloadCancelled:
+            self._cleanup_partial_file(filepath)
+            return 'cancelled'
+        finally:
+            self._release_output_path(filepath)
 
-            if not download_ok and not self._cancel_flag:
-                failed += 1
-                self._set_status(f'({i}/{len(docs)}) FAILED: {doc["name"][:50]} — {last_error}')
-                time.sleep(0.5)
+        self._enqueue_ui('status', f'FAILED: {doc["name"][:50]} - {last_error}')
+        return 'failed'
 
-            self._set_progress(i)
-            time.sleep(0.15)  # small courtesy delay
+    def _download_worker(self, docs: list[dict], out_path: Path):
+        total = len(docs)
+        workers = min(DEFAULT_WORKERS, total)
 
-        self.after(0, self._download_finished, success, failed, skipped, out_path)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='kdhe-dl') as pool:
+            futures = [pool.submit(self._download_one, doc, out_path, total) for doc in docs]
+            cancelled_pending = False
+
+            for fut in as_completed(futures):
+                if self._cancel_event.is_set() and not cancelled_pending:
+                    cancelled_pending = True
+                    for pending in futures:
+                        pending.cancel()
+
+                if fut.cancelled():
+                    result = 'cancelled'
+                else:
+                    try:
+                        result = fut.result()
+                    except Exception:
+                        result = 'failed'
+
+                with self._counter_lock:
+                    self._completed += 1
+                    if result == 'success':
+                        self._success += 1
+                    elif result == 'cancelled':
+                        self._cancelled += 1
+                    else:
+                        self._failed += 1
+                    completed = self._completed
+
+                self._enqueue_ui('progress', (completed, total))
+
+        with self._counter_lock:
+            done_payload = {
+                'success': self._success,
+                'failed': self._failed,
+                'cancelled': self._cancelled,
+                'out_path': out_path,
+            }
+        self._enqueue_ui('done', done_payload)
 
     def _set_status(self, msg: str):
-        self.after(0, lambda: self.status_var.set(msg))
+        self._enqueue_ui('status', msg)
 
     def _set_progress(self, value: int):
-        def update_progress():
-            self.progress.configure(value=value)
-            total = int(float(self.progress.cget('maximum')))
-            self.progress_label.config(text=f'{value} / {total}')
-
-        self.after(0, update_progress)
+        total = int(float(self.progress.cget('maximum')))
+        self._enqueue_ui('progress', (value, total))
 
     def _download_finished(self, success: int, failed: int, skipped: int, out_path: Path):
         self.download_btn.config(state='normal')
         self.cancel_btn.config(state='disabled')
-        completed = success + failed
+        completed = success + failed + skipped
         total = int(float(self.progress.cget('maximum')))
         self.progress.configure(value=completed)
         self.progress_label.config(text=f'{completed} / {total}')
